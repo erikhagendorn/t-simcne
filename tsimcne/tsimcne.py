@@ -2,6 +2,7 @@ from pathlib import Path
 
 import PIL
 import torch
+import torch.distributed as dist
 from lightning import pytorch as pl
 
 from .imagedistortions import (
@@ -33,6 +34,7 @@ class PLtSimCNE(pl.LightningModule):
         momentum=0.9,
         warmup="auto",
         use_ffcv=False,
+        devices=1,
     ):
         super().__init__()
         self.model = model
@@ -51,6 +53,7 @@ class PLtSimCNE(pl.LightningModule):
         self.momentum = momentum
         self.warmup = warmup
         self.use_ffcv = use_ffcv
+        self.devices = TSimCNE.device_count(devices)
 
         self._handle_parameters()
 
@@ -79,7 +82,7 @@ class PLtSimCNE(pl.LightningModule):
         # else: assume that the loss is a proper pytorch loss function
 
         if self.lr == "auto_batch":
-            self.lr = TSimCNE.lr_from_batchsize(self.batch_size)
+            self.lr = TSimCNE.lr_from_batchsize(self.batch_size, devices=self.devices)
 
         if self.warmup == "auto":
             self.warmup = 10 if self.n_epochs >= 100 else 0
@@ -120,7 +123,30 @@ class PLtSimCNE(pl.LightningModule):
             (i1, i2), _lbl = batch
         samples = torch.vstack((i1, i2))
 
-        features, backbone_features = self.model(samples)
+        if self.devices == 1:
+            features, backbone_features = self.model(samples)
+        else:
+            data = self.model(samples)
+
+            # Gather and concatenate 'data' across all processes in distributed training, synchronizing gradients
+            features, backbone_features = self.all_gather(data, sync_grads=True)
+
+            # Assuming features is of shape [num_devices, 2 * batch_size_per_device, feature_size]
+            num_devices = features.shape[0]
+            batch_size_per_device = features.shape[1] // 2
+            feature_size = features.shape[2]
+
+            features = features.view(num_devices, 2, batch_size_per_device, feature_size)
+            features = features.transpose(0, 1).contiguous()
+            features = features.view(-1, feature_size)
+
+            # Assuming backbone_features is of shape [num_devices, 2 * batch_size_per_device, backbone_feature_size]
+            backbone_feature_size = backbone_features.shape[2]
+
+            backbone_features = backbone_features.view(num_devices, 2, batch_size_per_device, backbone_feature_size)
+            backbone_features = backbone_features.transpose(0, 1).contiguous()
+            backbone_features = backbone_features.view(-1, backbone_feature_size)
+
         # backbone_features, _lbl are unused in infonce loss
         loss = self.loss(features, backbone_features, _lbl)
 
@@ -310,7 +336,7 @@ class TSimCNE:
         self.warmup = warmup
         self.freeze_schedule = freeze_schedule
         self.image_size = image_size
-        self.devices = devices
+        self.devices = self.device_count(devices)
         self.trainer_kwargs = trainer_kwargs
         self.num_workers = num_workers
         self.use_ffcv = use_ffcv
@@ -331,7 +357,7 @@ class TSimCNE:
         n_stages = self.n_stages
 
         if self.lr == "auto_batch":
-            lr = self.lr_from_batchsize(self.batch_size)
+            lr = self.lr_from_batchsize(self.batch_size, devices=self.devices)
             self.learning_rates = [lr, lr, lr / 1000][:n_stages]
         elif isinstance(self.lr, list):
             self.learning_rates = self.lr
@@ -373,24 +399,13 @@ class TSimCNE:
                 f"but got {self.freeze_schedule}."
             )
 
-        if self.devices != 1 and self.lr == "auto_batch":
-            import warnings
-
-            warnings.warn(
-                "devices is not 1, but the learning rate has not been adjusted."
-                "  Please see https://"
-                "lightning.ai/docs/pytorch/stable/accelerators/gpu_faq.html "
-                "for how to set the learning rate when using multiple devices"
-            )
-
         trainer_kwargs = dict(
-            gradient_clip_val=4, gradient_clip_algorithm="value"
+            gradient_clip_val=4, gradient_clip_algorithm="value", sync_batchnorm=True if self.devices > 1 else False
         )
         if self.trainer_kwargs is None:
             self.trainer_kwargs = trainer_kwargs
         else:
-            self.trainer_kwargs = trainer_kwargs.update(self.trainer_kwargs)
-
+            trainer_kwargs.update(self.trainer_kwargs)
     @staticmethod
     def check_ffcv(use_ffcv):
         if use_ffcv:
@@ -492,6 +507,7 @@ class TSimCNE:
                     metric=self.metric,
                     backbone=self.backbone,
                     projection_head=self.projection_head,
+                    devices=self.devices,
                     **train_kwargs,
                 )
 
@@ -508,6 +524,7 @@ class TSimCNE:
                     model=model,
                     loss=p.loss,
                     metric=p.metric,
+                    devices=self.devices,
                     **train_kwargs,
                 )
 
@@ -517,6 +534,7 @@ class TSimCNE:
                     model=model,
                     loss=p.loss,
                     metric=p.metric,
+                    devices=self.devices,
                     **train_kwargs,
                 )
             trainer = pl.Trainer(
@@ -533,49 +551,65 @@ class TSimCNE:
         return self
 
     def transform(
-        self,
-        X: torch.utils.data.Dataset,
-        data_transform=None,
-        return_labels: bool = False,
-        return_backbone_feat: bool = False,
+            self,
+            X: torch.utils.data.Dataset,
+            data_transform=None,
+            return_labels: bool = False,
+            return_backbone_feat: bool = False,
     ):
-        """Perform the 2D transform on the dataset, using the trained model.
-        :param X: The image dataset to be used for transformation.  Will be
-            wrapped into a data loader automatically.  If
-            ``use_ffcv=True``, then it needs to be a string pointing
-            to the .beton file.
-        :param data_transform: the data transformation to use for
-            calculating the final 2D embedding.  By default it will
-            not perform any data augmentation (as this is only
-            relevant during training).
-        :param False return_labels: Whether to return the labels that are
-            part of the dataset.
-        :param False return_backbone_feat: Whether to return the
-            high-dimensional features of the backbone.
-        """
-        data_transform = (
-            data_transform
-            if data_transform is not None
-            else self.data_transform_none
-        )
+        data_transform = data_transform if data_transform is not None else self.data_transform_none
         loader = self.make_dataloader(X, False, data_transform)
-        trainer = pl.Trainer(devices=1)
-        pred_batches = trainer.predict(self.plmodel, loader)
-        Y = torch.vstack([x[0] for x in pred_batches]).numpy()
-        backbone_features = torch.vstack([x[1] for x in pred_batches])
+        trainer = pl.Trainer(devices=self.devices)
 
-        if return_labels and return_backbone_feat:
-            labels = torch.hstack([lbl for _, lbl in loader])
-            return Y, labels, backbone_features
-        elif not return_labels and return_backbone_feat:
-            return Y, backbone_features
-        elif return_labels and not return_backbone_feat:
-            # XXX: this for some reason changes the labels; but I
-            # don't know what causes this!
-            labels = torch.hstack([lbl for _, lbl in loader])
-            return Y, labels
+        # Perform predictions
+        pred_batches = trainer.predict(self.plmodel, loader)
+
+        if self.devices != 1:
+            rank = dist.get_rank()
+
+            # Gather predictions from all processes
+            gathered_batches = [None] * self.devices
+            dist.all_gather_object(gathered_batches, pred_batches)
+
+            if rank == 0:
+                # Process gathered results on the master process
+                all_Y = []
+                all_backbone_features = []
+
+                for batch in gathered_batches:
+                    all_Y.extend([x[0] for x in batch])
+                    all_backbone_features.extend([x[1] for x in batch])
+
+                Y = torch.vstack(all_Y).numpy()
+                backbone_features = torch.vstack(all_backbone_features)
+
+                if return_labels:
+                    labels = torch.hstack([lbl for _, lbl in loader])
+
+                if return_labels and return_backbone_feat:
+                    return Y, labels, backbone_features
+                elif not return_labels and return_backbone_feat:
+                    return Y, backbone_features
+                elif return_labels and not return_backbone_feat:
+                    return Y, labels
+                else:
+                    return Y
         else:
-            return Y
+            # For non-distributed setting, process as in the original function
+            Y = torch.vstack([x[0] for x in pred_batches]).numpy()
+            backbone_features = torch.vstack([x[1] for x in pred_batches])
+
+            if return_labels:
+                labels = torch.hstack([lbl for _, lbl in loader])
+
+            if return_labels and return_backbone_feat:
+                return Y, labels, backbone_features
+            elif not return_labels and return_backbone_feat:
+                return Y, backbone_features
+            elif return_labels and not return_backbone_feat:
+                return Y, labels
+            else:
+                return Y
 
     def make_dataloader(self, X, train_or_test, data_transform):
         if data_transform is None:
@@ -683,7 +717,8 @@ class TSimCNE:
         return loader
 
     @staticmethod
-    def lr_from_batchsize(batch_size: int, /, mode="lin-bs") -> float:
+    def lr_from_batchsize(batch_size: int, /, mode="lin-bs", devices: int = 1) -> float:
+        batch_size *= devices
         if mode == "lin-bs":
             lr = 0.03 * batch_size / 256
         elif mode == "sqrt-bs":
@@ -693,6 +728,12 @@ class TSimCNE:
                 f"Unknown mode for calculating the lr ({mode = !r})"
             )
         return lr
+
+    @staticmethod
+    def device_count(devices):
+        if devices == -1:
+            return torch.cuda.device_count()
+        return devices
 
 
 class DummyLabelDataset(torch.utils.data.Dataset):
